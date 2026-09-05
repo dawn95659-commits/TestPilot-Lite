@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from time import perf_counter, sleep
 from typing import Any
 
 import httpx
 
+from .logging_utils import log_event
 from .models import ExecutionRecord, TestCase
 from .security import (
     SecurityError,
@@ -13,12 +15,17 @@ from .security import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 # =========================================================
 # Retry Policy
 # =========================================================
 
-# 默认允许自动重试的“读取型”请求。
-# 写操作默认不自动重试，避免重复创建 / 修改数据。
+# 默认只允许读取型请求自动重试。
+#
+# POST / PUT / PATCH / DELETE 默认不 Retry，
+# 避免因为网络异常导致重复写入。
 SAFE_RETRY_METHODS = frozenset(
     {
         "GET",
@@ -28,7 +35,8 @@ SAFE_RETRY_METHODS = frozenset(
 )
 
 
-# 通常表示临时服务故障，可以考虑稍后重试。
+# 这些状态通常表示临时服务故障，
+# Safe Method 可以考虑自动 Retry。
 RETRYABLE_STATUS_CODES = frozenset(
     {
         502,  # Bad Gateway
@@ -78,7 +86,7 @@ class LocalHttpClient:
         )
 
     # =====================================================
-    # Client
+    # HTTPX Client
     # =====================================================
 
     def _client(self) -> httpx.Client:
@@ -90,7 +98,7 @@ class LocalHttpClient:
         )
 
     # =====================================================
-    # Retry helpers
+    # Retry Policy Helpers
     # =====================================================
 
     @staticmethod
@@ -98,18 +106,11 @@ class LocalHttpClient:
         method: str,
     ) -> bool:
         """
-        判断 HTTP Method 是否允许默认自动重试。
+        当前允许自动 Retry 的 HTTP Method：
 
-        当前策略：
-
-        GET      -> 可以
-        HEAD     -> 可以
-        OPTIONS  -> 可以
-
-        POST     -> 不可以
-        PUT      -> 不可以
-        PATCH    -> 不可以
-        DELETE   -> 不可以
+        GET
+        HEAD
+        OPTIONS
         """
         return (
             method.upper()
@@ -121,40 +122,56 @@ class LocalHttpClient:
         status_code: int,
     ) -> bool:
         """
-        判断响应状态码是否属于临时故障。
+        当前允许 Retry 的临时 HTTP Status：
+
+        502
+        503
+        504
         """
         return (
             status_code
             in RETRYABLE_STATUS_CODES
         )
 
-    def _sleep_before_retry(
+    def _retry_delay_seconds(
         self,
         retry_index: int,
-    ) -> None:
+    ) -> float:
         """
-        Exponential Backoff：
+        Exponential Backoff。
 
         retry_backoff_seconds = 0.1 时：
 
-        第 1 次 Retry：
-            0.1 * 2^0 = 0.1 秒
+        Retry #1
+        -> 0.1 秒
 
-        第 2 次 Retry：
-            0.1 * 2^1 = 0.2 秒
+        Retry #2
+        -> 0.2 秒
 
-        第 3 次 Retry：
-            0.1 * 2^2 = 0.4 秒
+        Retry #3
+        -> 0.4 秒
         """
-        if self.retry_backoff_seconds == 0:
-            return
-
-        delay = (
+        return (
             self.retry_backoff_seconds
             * (2 ** retry_index)
         )
 
+    def _sleep_before_retry(
+        self,
+        retry_index: int,
+    ) -> None:
+        delay = self._retry_delay_seconds(
+            retry_index
+        )
+
+        if delay <= 0:
+            return
+
         sleep(delay)
+
+    # =====================================================
+    # HTTP Request + Retry
+    # =====================================================
 
     def _request_with_retry(
         self,
@@ -164,54 +181,72 @@ class LocalHttpClient:
         **kwargs: Any,
     ) -> httpx.Response:
         """
-        HTTP 请求 + Safe Retry Policy。
+        Safe Retry Policy。
 
         Retry 必须同时满足：
 
-        1. Method 可以安全 Retry
-        2. 错误属于临时故障
+        1. HTTP Method 允许安全 Retry
+        2. Failure 属于临时故障
         3. 还有剩余 Retry 次数
 
 
-        例如：
+        Examples
+        --------
 
         GET + Timeout
-            -> Retry
+        -> Retry
+
+        GET + ConnectError
+        -> Retry
 
         GET + 503
-            -> Retry
+        -> Retry
 
         GET + 404
-            -> 不 Retry
+        -> 不 Retry
+
+        GET + 422
+        -> 不 Retry
 
         POST + Timeout
-            -> 不 Retry
+        -> 不 Retry
 
         POST + 503
-            -> 不 Retry
+        -> 不 Retry
         """
+
         method = method.upper()
 
         retry_allowed = (
             self._can_retry_method(method)
         )
 
-        # max_retries 表示“额外重试次数”。
+        # max_retries 表示额外 Retry 次数。
         #
         # max_retries = 2：
         #
-        # 第 1 次原始请求
-        # 第 2 次 retry
-        # 第 3 次 retry
+        # Request #1
+        # Retry   #1
+        # Retry   #2
         #
-        # 总共最多 3 次。
+        # 最多共请求 3 次。
         total_attempts = (
             self.max_retries + 1
             if retry_allowed
             else 1
         )
 
-        for attempt in range(total_attempts):
+        for attempt_index in range(
+            total_attempts
+        ):
+            request_number = (
+                attempt_index + 1
+            )
+
+            # -------------------------------------------------
+            # Transport Layer
+            # -------------------------------------------------
+
             try:
                 response = client.request(
                     method,
@@ -219,37 +254,63 @@ class LocalHttpClient:
                     **kwargs,
                 )
 
-            except httpx.TransportError:
-                # -----------------------------------------
-                # Timeout / ConnectError / ProtocolError
-                # 等 Transport 层错误
-                # -----------------------------------------
-
+            except httpx.TransportError as exc:
                 has_more_attempts = (
-                    attempt
+                    attempt_index
                     < total_attempts - 1
                 )
 
+                # 已经没有 Retry 机会。
                 if not has_more_attempts:
+                    log_event(
+                        logger,
+                        "http_retry_exhausted",
+                        method=method,
+                        url=url,
+                        attempt=request_number,
+                        max_attempts=total_attempts,
+                        reason=type(exc).__name__,
+                    )
+
                     raise
 
-                # 当前 method 一定是 safe method，
-                # 因为非 safe method 的 total_attempts=1。
+                delay = (
+                    self._retry_delay_seconds(
+                        attempt_index
+                    )
+                )
+
+                log_event(
+                    logger,
+                    "http_retry",
+                    method=method,
+                    url=url,
+                    attempt=request_number,
+                    next_attempt=(
+                        request_number + 1
+                    ),
+                    max_attempts=total_attempts,
+                    reason=type(exc).__name__,
+                    retry_in_seconds=delay,
+                )
+
                 self._sleep_before_retry(
-                    attempt
+                    attempt_index
                 )
 
                 continue
 
-            # ---------------------------------------------
-            # HTTP 已经收到响应，但服务暂时不可用
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # HTTP Response Received
+            # -------------------------------------------------
 
             has_more_attempts = (
-                attempt
+                attempt_index
                 < total_attempts - 1
             )
 
+            # GET / HEAD / OPTIONS 收到
+            # 502 / 503 / 504 时可以 Retry。
             if (
                 retry_allowed
                 and self._can_retry_status(
@@ -257,28 +318,87 @@ class LocalHttpClient:
                 )
                 and has_more_attempts
             ):
-                # 当前 Response 后续不再使用。
+                delay = (
+                    self._retry_delay_seconds(
+                        attempt_index
+                    )
+                )
+
+                log_event(
+                    logger,
+                    "http_retry",
+                    method=method,
+                    url=url,
+                    attempt=request_number,
+                    next_attempt=(
+                        request_number + 1
+                    ),
+                    max_attempts=total_attempts,
+                    reason=(
+                        f"status_"
+                        f"{response.status_code}"
+                    ),
+                    status_code=(
+                        response.status_code
+                    ),
+                    retry_in_seconds=delay,
+                )
+
+                # 当前 Response 后续不用了。
                 response.close()
 
                 self._sleep_before_retry(
-                    attempt
+                    attempt_index
                 )
 
                 continue
 
-            # ---------------------------------------------
-            # 正常返回
+            # -------------------------------------------------
+            # Retryable Status 已经耗尽次数
+            # -------------------------------------------------
+
+            if (
+                retry_allowed
+                and self._can_retry_status(
+                    response.status_code
+                )
+                and not has_more_attempts
+            ):
+                log_event(
+                    logger,
+                    "http_retry_exhausted",
+                    method=method,
+                    url=url,
+                    attempt=request_number,
+                    max_attempts=total_attempts,
+                    reason=(
+                        f"status_"
+                        f"{response.status_code}"
+                    ),
+                    status_code=(
+                        response.status_code
+                    ),
+                )
+
+            # -------------------------------------------------
+            # 最终 Response
+            # -------------------------------------------------
             #
-            # 这里包括：
+            # 包括：
             #
             # 200 / 201
             # 404
             # 405
+            # 409
             # 422
             #
-            # 也包括：
-            # 已经耗尽 Retry 后的 502/503/504
-            # ---------------------------------------------
+            # 也包括已经耗尽 Retry 的：
+            # 502 / 503 / 504
+            #
+            # 注意：
+            # 404 / 422 并不等于 TestCase Failed。
+            # Validator 会根据 expected_status 判断。
+            # -------------------------------------------------
 
             return response
 
@@ -295,51 +415,92 @@ class LocalHttpClient:
         self,
         url: str,
     ) -> dict[str, Any]:
-        validate_local_url(
-            url,
-            self.allowed_ports,
-        )
-
-        with self._client() as client:
-            response = (
-                self._request_with_retry(
-                    client,
-                    "GET",
-                    url,
-                    headers={
-                        "Accept":
-                        "application/json",
-                    },
-                )
-            )
-
-        # 如果重试全部结束后还是：
-        #
-        # 404 / 500 / 503 ...
-        #
-        # OpenAPI 获取就是失败。
-        response.raise_for_status()
-
-        if (
-            len(response.content)
-            > self.max_openapi_bytes
-        ):
-            raise ValueError(
-                "OpenAPI 文档超过大小限制："
-                f"{self.max_openapi_bytes} bytes"
-            )
+        started = perf_counter()
 
         try:
-            payload = response.json()
-        except ValueError as exc:
-            raise ValueError(
-                "OpenAPI 响应不是合法 JSON"
-            ) from exc
-
-        if not isinstance(payload, dict):
-            raise ValueError(
-                "OpenAPI 响应必须是 JSON object"
+            validate_local_url(
+                url,
+                self.allowed_ports,
             )
+
+            with self._client() as client:
+                response = (
+                    self._request_with_retry(
+                        client,
+                        "GET",
+                        url,
+                        headers={
+                            "Accept":
+                            "application/json",
+                        },
+                    )
+                )
+
+            response.raise_for_status()
+
+            if (
+                len(response.content)
+                > self.max_openapi_bytes
+            ):
+                raise ValueError(
+                    "OpenAPI 文档超过大小限制："
+                    f"{self.max_openapi_bytes} bytes"
+                )
+
+            try:
+                payload = response.json()
+
+            except ValueError as exc:
+                raise ValueError(
+                    "OpenAPI 响应不是合法 JSON"
+                ) from exc
+
+            if not isinstance(
+                payload,
+                dict,
+            ):
+                raise ValueError(
+                    "OpenAPI 响应必须是 JSON object"
+                )
+
+        except (
+            httpx.HTTPError,
+            SecurityError,
+            ValueError,
+        ) as exc:
+            latency_ms = (
+                perf_counter() - started
+            ) * 1000
+
+            log_event(
+                logger,
+                "openapi_fetch_failed",
+                url=url,
+                latency_ms=round(
+                    latency_ms,
+                    2,
+                ),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+            raise
+
+        latency_ms = (
+            perf_counter() - started
+        ) * 1000
+
+        log_event(
+            logger,
+            "openapi_fetch_success",
+            url=url,
+            status_code=response.status_code,
+            bytes=len(response.content),
+            latency_ms=round(
+                latency_ms,
+                2,
+            ),
+        )
 
         return payload
 
@@ -366,6 +527,15 @@ class LocalHttpClient:
             case.needs_approval
             and not approved
         ):
+            log_event(
+                logger,
+                "test_case_blocked",
+                case_id=case.case_id,
+                method=case.method,
+                path=case.path,
+                reason="approval_required",
+            )
+
             return ExecutionRecord(
                 case_id=case.case_id,
                 blocked=True,
@@ -382,11 +552,11 @@ class LocalHttpClient:
 
             # latency 包含：
             #
-            # 请求时间
+            # HTTP Request
             # +
-            # Retry 时间
+            # Retry
             # +
-            # Backoff 时间
+            # Exponential Backoff
             started = perf_counter()
 
             with self._client() as client:
@@ -418,14 +588,33 @@ class LocalHttpClient:
                 response_json: Any | None = (
                     response.json()
                 )
+
             except ValueError:
-                # 接口返回 HTML / text/plain 等内容时，
-                # HTTP 请求本身仍然可能成功。
+                # 返回 HTML / text/plain 等内容，
+                # 不属于 Transport Error。
                 #
-                # 所以这里不当 TransportError，
-                # 而是保存 response_text，
-                # 后续交给 Validator 判断。
+                # 保存原始文本，
+                # 后续由 Validator 判断。
                 response_json = None
+
+            log_event(
+                logger,
+                "test_case_http_result",
+                case_id=case.case_id,
+                method=case.method,
+                path=case.path,
+                status_code=(
+                    response.status_code
+                ),
+                latency_ms=round(
+                    latency_ms,
+                    2,
+                ),
+                response_is_json=(
+                    response_json
+                    is not None
+                ),
+            )
 
             return ExecutionRecord(
                 case_id=case.case_id,
@@ -444,6 +633,18 @@ class LocalHttpClient:
             SecurityError,
             ValueError,
         ) as exc:
+            log_event(
+                logger,
+                "test_case_transport_error",
+                case_id=case.case_id,
+                method=case.method,
+                path=case.path,
+                error_type=(
+                    type(exc).__name__
+                ),
+                error=str(exc),
+            )
+
             return ExecutionRecord(
                 case_id=case.case_id,
                 transport_error=str(exc),
