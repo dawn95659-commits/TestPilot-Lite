@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+data/sessions/*.json
+data/reports/*.json
+data/reports/*.md
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+
+# OS / IDE local files
+.DS_Store
+Thumbs.db
+
+

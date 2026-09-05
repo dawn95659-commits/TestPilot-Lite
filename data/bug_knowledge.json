@@ -1,0 +1,125 @@
+[
+  {
+    "bug_id": "validation-422",
+    "title": "422 请求参数校验失败",
+    "keywords": ["422", "validation", "missing", "required", "类型", "请求体", "参数"],
+    "likely_cause": "必填字段缺失、字段类型错误，或请求体没有按 application/json 发送。",
+    "checks": [
+      "对照 OpenAPI 的 required、type、minimum 和 enum",
+      "确认 Content-Type 与请求体格式一致",
+      "检查路径参数和查询参数是否放在正确位置"
+    ]
+  },
+  {
+    "bug_id": "fixture-404",
+    "title": "404 测试数据或路径不存在",
+    "keywords": ["404", "not", "found", "不存在", "资源", "路径"],
+    "likely_cause": "测试依赖的 fixture 未创建，或 path parameter 指向不存在的资源。",
+    "checks": [
+      "先查询列表接口确认可用 ID",
+      "检查路径参数替换是否正确",
+      "让测试之间不依赖不可控的执行顺序"
+    ]
+  },
+  {
+    "bug_id": "schema-mismatch",
+    "title": "响应 JSON Schema 不匹配",
+    "keywords": ["schema", "结构", "字段", "required", "匹配", "json"],
+    "likely_cause": "实现返回字段与 OpenAPI 契约不同，或者契约没有随代码更新。",
+    "checks": [
+      "比较失败位置、字段名与实际类型",
+      "确认错误响应和成功响应使用不同 Schema",
+      "修复实现或更新契约后加入回归用例"
+    ]
+  },
+  {
+    "bug_id": "timeout-network",
+    "title": "请求超时或本地服务不可达",
+    "keywords": ["timeout", "connect", "请求失败", "超时", "连接"],
+    "likely_cause": "样例 API 未启动、端口不正确，或接口处理时间超过限制。",
+    "checks": [
+      "访问 /health 或 /docs 验证服务状态",
+      "核对端口白名单与启动命令",
+      "记录慢调用并检查阻塞 I/O"
+    ]
+  },
+  {
+    "bug_id": "unsafe-write",
+    "title": "写操作被安全策略拦截",
+    "keywords": ["blocked", "拦截", "审批", "post", "delete", "put", "patch"],
+    "likely_cause": "POST、PUT、PATCH 或 DELETE 没有得到明确的人工批准。",
+    "checks": [
+      "在页面检查写操作的请求体和目标路径",
+      "确认测试对象是自己创建的本地服务",
+      "批准后再恢复 Agent，不能绕过审批"
+    ]
+  },
+  {
+  "bug_id": "method-not-allowed-405",
+  "title": "405 请求方法与接口定义不匹配",
+  "keywords": [
+    "405",
+    "method",
+    "method not allowed",
+    "请求方法",
+    "方法不允许",
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE"
+  ],
+  "likely_cause": "客户端使用了错误的 HTTP Method，或者 OpenAPI 契约与服务端实际路由定义不一致。例如接口只允许 GET，但测试请求使用了 POST。",
+  "checks": [
+    "检查 TestCase 中的 method 是否与 OpenAPI 中声明的方法一致",
+    "检查服务端路由装饰器是否使用了正确的 HTTP Method",
+    "打开 OpenAPI 文档确认该 path 实际允许哪些方法",
+    "确认接口路径没有因为版本或重构发生变化"
+  ]
+},
+{
+  "bug_id": "non-json-response",
+  "title": "接口返回非 JSON 响应",
+  "keywords": [
+    "json",
+    "decode",
+    "json decode error",
+    "non json",
+    "非 JSON",
+    "content-type",
+    "text/html",
+    "text/plain",
+    "响应解析失败"
+  ],
+  "likely_cause": "测试期望接口返回 JSON，但服务端实际返回了纯文本、HTML 错误页或其他 Content-Type。也可能是服务端异常处理没有按照 OpenAPI 契约返回 JSON。",
+  "checks": [
+    "检查响应头 Content-Type 是否为 application/json",
+    "打印原始 response.text，确认服务端实际返回内容",
+    "检查服务端异常处理器是否返回了 HTML 或纯文本",
+    "对照 OpenAPI responses，确认接口声明的响应格式与实际实现一致"
+  ]
+},
+{
+  "bug_id": "unexpected-server-500",
+  "title": "服务端出现未处理的 500 异常",
+  "keywords": [
+    "500",
+    "internal server error",
+    "server error",
+    "服务器异常",
+    "未处理异常",
+    "exception",
+    "traceback",
+    "崩溃"
+  ],
+  "likely_cause": "服务端代码出现未捕获异常，例如访问空对象、错误的字段类型、依赖服务失败或业务代码异常，导致接口返回 500 Internal Server Error。",
+  "checks": [
+    "查看被测试服务的日志和 traceback，定位最先抛出的异常",
+    "检查导致失败的 TestCase 请求参数和请求体",
+    "确认服务端是否对缺失数据、空值和异常输入进行了处理",
+    "检查数据库、文件或其他依赖服务是否正常",
+    "修复异常后重新执行相同 TestCase，确认不再返回 500"
+  ]
+}
+]
+

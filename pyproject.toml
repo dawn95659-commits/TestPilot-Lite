@@ -1,0 +1,13 @@
+[project]
+name = "testpilot-lite"
+version = "0.1.0"
+description = "A local-only API testing agent for learning tool calling, approval and evaluation."
+requires-python = ">=3.11,<3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["testpilot"]
+
